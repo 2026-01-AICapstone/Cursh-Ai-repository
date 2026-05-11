@@ -8,11 +8,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import transformers
-# import wandb
-
-# M1에서 호환되지 않는 DeepSpeed 임포트 주석 처리
-# from deepspeed import zero
-# from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
 from args import (HyperparamArguments, LoraArguments, ModelArguments,
                   TrainingArguments)
@@ -20,10 +15,10 @@ from classifier import HarmbenchClassifier
 from dataset import RepBendingDataset
 from trainer import CustomTrainer
 from peft import LoraConfig, get_peft_model
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-# 🔥 [CRUSH] crush_loss.py에서 CentroidManager 불러오기
-from crush_loss import CentroidManager
+from crush_loss import FixedCentroidHolder
+from clustering import cluster_unsafe_prompts
 
 
 def data_collator(batch_list):
@@ -46,12 +41,7 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, TrainingArguments, LoraArguments, HyperparamArguments)
     )
-    (
-        model_args,
-        training_args,
-        lora_args,
-        hyperparam_args,
-    ) = parser.parse_args_into_dataclasses()
+    (model_args, training_args, lora_args, hyperparam_args) = parser.parse_args_into_dataclasses()
 
     print(hyperparam_args.to_dict())
     print(lora_args)
@@ -61,7 +51,7 @@ def train():
     device_map = "auto"
     model_name_or_path = model_args.model_name_or_path
 
-    # 🔥 [CRUSH] 모델의 config를 먼저 불러와 전체 레이어 수(Architecture) 파악
+    # ---------- 모델 config / target layer 자동 감지 ----------
     config = AutoConfig.from_pretrained(model_name_or_path)
     total_layers = config.num_hidden_layers
 
@@ -71,24 +61,27 @@ def train():
     transform_layers = hyperparam_args.transform_layers
     full_layers = hyperparam_args.full_layers
 
-    # 🔥 [CRUSH] Qwen, LLaMA 등 모델에 따른 중후반 레이어 자동 감지 로직
     auto_start_layer = int(total_layers * 0.5)
     auto_end_layer = total_layers - 1
 
     if target_layers == "" or target_layers == "-1":
-        # 쉘 스크립트에서 "-1"을 넘겼을 경우 자동 계산 (예: 32레이어면 16~30)
         hyperparam_args.target_layers = list(range(auto_start_layer, auto_end_layer))
-        print(f"✅ 모델 자동 감지: 총 {total_layers}개 레이어 중 {auto_start_layer}번째부터 {auto_end_layer - 1}번째 레이어를 타겟으로 설정합니다.")
+        print(f"✅ 모델 자동 감지: 총 {total_layers}개 레이어 중 "
+              f"{auto_start_layer}번째부터 {auto_end_layer - 1}번째 레이어를 타겟으로 설정합니다.")
     elif layers_window_size > 0 and target_layers != "-1":
         hyperparam_args.target_layers = list(range(target_layer_start_idx, target_layer_start_idx + layers_window_size))
     else:
         hyperparam_args.target_layers = [int(layer) for layer in target_layers.split(",")]
 
-    # LoRA 변환 레이어도 타겟 레이어와 동일하게 설정
     if "-1" in transform_layers:
         lora_layers_to_transform = hyperparam_args.target_layers
     else:
         lora_layers_to_transform = [int(layer) for layer in transform_layers.split(",")]
+
+    # ---------- 클러스터링용 레이어 (target_layers 중간) ----------
+    target_layers_list = hyperparam_args.target_layers
+    cluster_layer = target_layers_list[len(target_layers_list) // 2]
+    print(f"✅ 클러스터링 레이어: {cluster_layer} (target_layers={target_layers_list})")
 
     lora_config = LoraConfig(
         r=lora_args.lora_r,
@@ -107,6 +100,7 @@ def train():
     if drop_layers_after:
         config.num_hidden_layers = drop_layers_after + 1
 
+    # ---------- Tokenizer ----------
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
         model_max_length=training_args.max_seq_length,
@@ -115,17 +109,21 @@ def train():
     )
     tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
-    train_dataset = RepBendingDataset(tokenizer, num_examples=500, mode=hyperparam_args.loss_mode, max_length=512,
-                                      model_name_or_path=model_name_or_path, dataset_path=hyperparam_args.dataset_path,
-                                      split=hyperparam_args.dataset_split, is_online=hyperparam_args.is_online)
+    # ---------- Dataset (pseudo-label 미주입 상태로 생성) ----------
+    train_dataset = RepBendingDataset(
+        tokenizer, num_examples=500, mode=hyperparam_args.loss_mode,
+        max_length=512, model_name_or_path=model_name_or_path,
+        dataset_path=hyperparam_args.dataset_path,
+        split=hyperparam_args.dataset_split,
+        is_online=hyperparam_args.is_online
+    )
 
-    from transformers import BitsAndBytesConfig
-
+    # ---------- Base 모델 로드 (4bit) ----------
     bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,  # 4bit 양자화
-        bnb_4bit_quant_type="nf4",  # 양자화 방식 (nf4 권장)
-        bnb_4bit_compute_dtype=torch.float16,  # 연산은 fp16으로
-        bnb_4bit_use_double_quant=True,  # 이중 양자화로 추가 절약
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
     )
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -136,6 +134,52 @@ def train():
     )
     training_args.model_name_or_path = model_name_or_path
 
+    # ============================================================
+    # ★ 학습 시작 전 클러스터링 단계
+    #   1. Base 모델로 DNA 프롬프트의 hidden 추출
+    #   2. K-Means → pseudo-label 생성
+    #   3. centroid 사전 계산 후 고정
+    #   4. dataset.set_pseudo_labels() 주입
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("🌀 학습 전 클러스터링 단계")
+    print("=" * 70)
+
+    NUM_CATEGORIES = 5
+    cache_dir = os.path.join(training_args.output_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    hidden_cache_path = os.path.join(cache_dir, f"dna_hidden_layer{cluster_layer}.npz")
+
+    pseudo_labels, init_centroids = cluster_unsafe_prompts(
+        base_model=model,
+        tokenizer=tokenizer,
+        raw_unsafe_prompts=train_dataset.data_unsafe_request_prompts,
+        true_labels=train_dataset.data_unsafe_true_labels,
+        target_layer=cluster_layer,
+        num_clusters=NUM_CATEGORIES,
+        cache_path=hidden_cache_path,
+        random_state=42,
+    )
+    train_dataset.set_pseudo_labels(pseudo_labels)
+
+    # FixedCentroidHolder: 학습 내내 고정
+    centroid_holder = FixedCentroidHolder(init_centroids.to(model.device))
+
+    # ---------- centroid 즉시 저장 (시각화/inference에서 사용) ----------
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    init_centroid_path = os.path.join(training_args.output_dir, "crush_centroids_initial.pt")
+    torch.save({
+        "centroids": init_centroids.cpu(),
+        "pseudo_labels": pseudo_labels,
+        "true_labels": train_dataset.data_unsafe_true_labels,
+        "cluster_layer": cluster_layer,
+        "num_clusters": NUM_CATEGORIES,
+    }, init_centroid_path)
+    print(f"💾 초기 centroid 저장: {init_centroid_path}")
+
+    # ============================================================
+    # LoRA 적용 후 학습
+    # ============================================================
     model = get_peft_model(model, lora_config)
     print("model", model)
 
@@ -154,10 +198,6 @@ def train():
 
     training_args.remove_unused_columns = False
 
-    # 🔥 [CRUSH] Seeded K-Means로 분류한 클러스터 수(5개)로 세팅
-    NUM_CATEGORIES = 5
-    centroid_mgr = CentroidManager(num_classes=NUM_CATEGORIES, hidden_size=model.config.hidden_size)
-
     trainer = CustomTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -168,22 +208,25 @@ def train():
         packing=True,
         hyperparam_args=hyperparam_args,
         classifier=classifier,
-        centroid_mgr=centroid_mgr  # 세팅된 관리자를 CustomTrainer에 전달
+        centroid_holder=centroid_holder,  # 고정 centroid 주입
     )
     model.config.use_cache = False
 
     trainer.train()
 
-    # 학습 완료 후 모델 가중치 및 최종 중심점(Centroids) 좌표 파일 저장
+    # ---------- 학습 완료 후 저장 ----------
     trainer.save_model(training_args.output_dir)
-    torch.save(centroid_mgr.centroids, f"{training_args.output_dir}/crush_centroids.pt")
-    print(f"✅ 학습 완료! 중심점 데이터가 {training_args.output_dir}/crush_centroids.pt 에 저장되었습니다.")
+    # 학습 후에도 centroid는 동일 (고정이었음). evaluate.py 호환 위해 같은 이름으로 저장.
+    final_centroid_path = os.path.join(training_args.output_dir, "crush_centroids.pt")
+    torch.save(centroid_holder.centroids.cpu(), final_centroid_path)
+    print(f"\n✅ 학습 완료!")
+    print(f"   고정 centroid: {final_centroid_path}")
+    print(f"   진단/검증 정보: {init_centroid_path}")
 
 
 if __name__ == "__main__":
     SEED = 42
 
-    # 하드코딩된 CUDA 시드 설정을 디바이스(CUDA/MPS/CPU) 환경에 맞춰 동적으로 작동하게 변경
     if torch.cuda.is_available():
         torch.cuda.manual_seed(SEED)
         torch.cuda.manual_seed_all(SEED)
@@ -192,6 +235,5 @@ if __name__ == "__main__":
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    #torch.use_deterministic_algorithms(True)
 
     train()
