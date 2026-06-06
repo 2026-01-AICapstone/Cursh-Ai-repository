@@ -43,8 +43,8 @@ from dataset import RepBendingDataset
 # =========================================================
 BASE_MODEL = "Qwen/Qwen2-0.5B-Instruct"
 LORA_PATH = "./out/test"
-CENTROIDS_PATH = "./out/test/crush_centroids.pt"
-INIT_CENTROIDS_PATH = "./out/test/crush_centroids_initial.pt"  # cluster_layer 정보 포함
+CENTROIDS_PATH = "out/test/0518/crush_centroids.pt"
+INIT_CENTROIDS_PATH = "out/test/0518/crush_centroids_initial.pt"  # cluster_layer 정보 포함
 EVAL_PROMPTS_TXT = "./eval_prompts.txt"
 
 # "train_data" : 학습 데이터로 평가 (학습 효과 확인용)

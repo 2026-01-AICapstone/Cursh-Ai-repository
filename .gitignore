@@ -1,0 +1,15 @@
+# 데이터셋 및 대용량 파일 제외
+wildjailbreak.jsonl
+*.png
+*.jpg
+*.jpeg
+
+# 결과물 및 로그 폴더 제외
+out/
+debug_training_log.txt
+
+# 파이썬 및 IDE 설정 파일 제외
+__pycache__/
+.idea/
+.venv/
+.vscode/
